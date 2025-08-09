@@ -15,7 +15,7 @@ spec:
                 tokenRef:
                   secretName: gh-pat
                   key: token
-                cloneProtocol: https
+              cloneProtocol: https
               filters:
                 - repositoryMatch: '.*-delivery$'
 #          - scmProvider:
