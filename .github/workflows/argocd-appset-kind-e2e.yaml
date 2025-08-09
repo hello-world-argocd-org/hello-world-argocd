@@ -12,20 +12,16 @@ jobs:
     permissions:
       contents: read
     env:
-      # Paths
       APPSET_DIR: applicationsets
       ARGO_NS: argocd
-      ARGO_HELM_CHART_VERSION: "8.2.7"
+      ARGO_HELM_CHART_VERSION: "5.51.6"
       WAIT_ROLLOUT: "240s"
       WAIT_APPS: "90"
-      # Map org/repo PAT once for easy reuse (may be empty on PRs from forks)
-      GH_PAT: ${{ secrets.GH_PAT }}
+      GH_PAT: ${{ secrets.GH_PAT }}   # optional; used only by SCM provider
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
       - name: Install tools (Helm, yq, jq)
         shell: bash
@@ -50,163 +46,78 @@ jobs:
             --version "$ARGO_HELM_CHART_VERSION" \
             --set applicationSet.enabled=true \
             --wait
-          # Rollout checks (non-fatal to keep logs on failures)
-          kubectl -n "$ARGO_NS" rollout status deploy/argocd-application-controller --timeout="$WAIT_ROLLOUT" || true
           kubectl -n "$ARGO_NS" rollout status deploy/argocd-repo-server --timeout="$WAIT_ROLLOUT" || true
-          kubectl -n "$ARGO_NS" rollout status deploy/argocd-server --timeout="$WAIT_ROLLOUT" || true
 
-      # ---------- SANITY CHECKS (Argo basics) ----------
-      - name: Sanity — Argo namespace and pods
+      # DNS: force CoreDNS to forward to public resolvers
+      - name: Force CoreDNS to use public DNS
         shell: bash
         run: |
           set -euo pipefail
-          kubectl get ns "$ARGO_NS"
-          kubectl -n "$ARGO_NS" get deploy,pods -o wide
+          kubectl -n kube-system get configmap coredns -o yaml > /tmp/coredns.yaml
+          sed -i -E 's#forward[[:space:]]+\.[[:space:]]+/etc/resolv\.conf#forward . 8.8.8.8 8.8.4.4#g' /tmp/coredns.yaml || true
+          kubectl apply -f /tmp/coredns.yaml
+          kubectl -n kube-system rollout restart deploy coredns
+          kubectl -n kube-system rollout status deploy coredns --timeout=90s || true
 
-      - name: Sanity — Argo core secrets exist (argocd-secret)
-        shell: bash
-        run: |
-          # argocd-secret holds server.secretkey; it can take a few secs to appear.
-          for i in {1..12}; do
-            if kubectl -n "$ARGO_NS" get secret argocd-secret >/dev/null 2>&1; then
-              echo "argocd-secret present."
-              exit 0
-            fi
-            sleep 5
-          done
-          echo "argocd-secret not found after waiting." >&2
-          kubectl -n "$ARGO_NS" get secrets
-          exit 1
-
-      # ---------- CREDENTIALS FOR SCM + GIT CLONE ----------
-      - name: Configure GitHub PAT for SCM generator (gh-pat)
+      # OPTIONAL: SCM provider token for GitHub API listing/rate limits
+      - name: Create gh-pat for SCM provider (optional)
         if: ${{ github.event_name != 'pull_request' && env.GH_PAT != '' }}
         shell: bash
         run: |
-          set -euo pipefail
           kubectl -n "$ARGO_NS" create secret generic gh-pat \
             --from-literal=token="${GH_PAT}" \
             --dry-run=client -o yaml | kubectl apply -f -
 
-      - name: Sanity — gh-pat secret present (SCM token)
-        if: ${{ github.event_name != 'pull_request' && env.GH_PAT != '' }}
+      # Make sure NO repo-creds exist (public repos should be cloned anonymously)
+      - name: Ensure no repo-creds are present
         shell: bash
         run: |
-          set -euo pipefail
-          kubectl -n "$ARGO_NS" get secret gh-pat -o jsonpath='{.metadata.name}{"\n"}'
+          kubectl -n "$ARGO_NS" get secret -l argocd.argoproj.io/secret-type=repo-creds --no-headers 2>/dev/null | awk '{print $1}' | \
+          xargs -r -I{} kubectl -n "$ARGO_NS" delete secret {}
 
-      - name: Configure Argo CD repo-creds for GitHub org (HTTPS + PAT)
-        if: ${{ github.event_name != 'pull_request' && env.GH_PAT != '' }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          cat <<YAML | kubectl -n "$ARGO_NS" apply -f -
-          apiVersion: v1
-          kind: Secret
-          metadata:
-            name: github-org-creds
-            labels:
-              argocd.argoproj.io/secret-type: repo-creds
-          stringData:
-            url: https://github.com/hello-world-argocd-org
-            username: x-access-token
-            password: ${GH_PAT}
-          type: Opaque
-          YAML
-
-      - name: Sanity — repo-creds labeled and shaped
-        if: ${{ github.event_name != 'pull_request' && env.GH_PAT != '' }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          kubectl -n "$ARGO_NS" get secret github-org-creds \
-            -o jsonpath='{.metadata.labels.argocd\.argoproj\.io/secret-type}{"\n"}'
-          # Show keys only (no values)
-          kubectl -n "$ARGO_NS" get secret github-org-creds -o json | jq -r '.data | keys[]'
-
-      - name: Nudge repo-server to pick up new creds
-        if: ${{ github.event_name != 'pull_request' && env.GH_PAT != '' }}
-        shell: bash
-        run: |
-          kubectl -n "$ARGO_NS" rollout restart deploy/argocd-repo-server
-          kubectl -n "$ARGO_NS" rollout status deploy/argocd-repo-server --timeout=120s || true
-
-      # ---------- APPLY APPSET ----------
       - name: Show what we are going to apply
         shell: bash
         run: |
-          set -euo pipefail
           for f in $APPSET_DIR/*.yaml; do
             echo "---- $f ----"
             yq e '.kind + " " + .metadata.name' "$f" || true
           done
 
-      - name: Force CoreDNS to use public resolvers
+      - name: Apply ApplicationSet manifests
         shell: bash
         run: |
-          set -euo pipefail
-          # Grab current CoreDNS config
-          kubectl -n kube-system get configmap coredns -o yaml > /tmp/coredns.yaml
-          
-          # Replace the forwarder line to use Google Public DNS
-          if grep -qE 'forward[[:space:]]+\.[[:space:]]+/etc/resolv\.conf' /tmp/coredns.yaml; then
-            sed -i -E 's#forward[[:space:]]+\.[[:space:]]+/etc/resolv\.conf#forward . 8.8.8.8 8.8.4.4#g' /tmp/coredns.yaml
-          else
-            # Fallback: replace any existing forwarder line
-            sed -i -E 's#forward[[:space:]]+\.[[:space:]]+.*#forward . 8.8.8.8 8.8.4.4#g' /tmp/coredns.yaml
-          fi
-          
-          # Apply and bounce CoreDNS
-          kubectl apply -f /tmp/coredns.yaml
-          kubectl -n kube-system rollout restart deploy coredns
-          kubectl -n kube-system rollout status deploy coredns --timeout=90s || true
+          kubectl -n "$ARGO_NS" apply -f "$APPSET_DIR/"
 
-      - name: Sanity — repo-server can reach GitHub (ls-remote)
+      # Sanity: repo-server can resolve GitHub & list refs
+      - name: Sanity — repo-server can reach GitHub (DNS + ls-remote)
         shell: bash
         run: |
           set -euo pipefail
           POD=$(kubectl -n "$ARGO_NS" get pod -l app.kubernetes.io/name=argocd-repo-server -o jsonpath='{.items[0].metadata.name}')
           CONTAINER=$(kubectl -n "$ARGO_NS" get pod "$POD" -o jsonpath='{.spec.containers[0].name}')
           echo "Using pod=$POD container=$CONTAINER"
-          kubectl -n "$ARGO_NS" exec "$POD" -c "$CONTAINER" -- \
-            sh -c 'getent hosts github.com || nslookup github.com || true'
+          kubectl -n "$ARGO_NS" exec "$POD" -c "$CONTAINER" -- sh -c 'getent hosts github.com || nslookup github.com || true'
           kubectl -n "$ARGO_NS" exec "$POD" -c "$CONTAINER" -- \
             git ls-remote https://github.com/hello-world-argocd-org/hello-world-delivery.git | head -n1
-
-      - name: Apply ApplicationSet manifests
-        shell: bash
-        run: |
-          set -euo pipefail
-          kubectl -n "$ARGO_NS" apply -f "$APPSET_DIR/"
-
-      # ---------- EXTRA VISIBILITY ----------
-      - name: Dump ApplicationSet (rendered spec)
-        shell: bash
-        run: |
-          kubectl -n "$ARGO_NS" get applicationset orgs-delivery-envs -o yaml || true
 
       - name: Wait for Applications to be generated
         shell: bash
         run: |
           set -euo pipefail
-          echo "Waiting for Applications to appear from ApplicationSet(s)…"
-          end=$((SECONDS + $WAIT_APPS))
+          end=$((SECONDS + WAIT_APPS))
           ok=0
           while [ $SECONDS -lt $end ]; do
             count=$(kubectl -n "$ARGO_NS" get applications.argoproj.io -o json 2>/dev/null | jq '.items | length')
             if [ "${count:-0}" -ge 1 ]; then
               echo "Found $count Application(s)."
-              ok=1
-              break
+              ok=1; break
             fi
-            # Show repo-server hints while we wait
-            kubectl -n "$ARGO_NS" logs deploy/argocd-repo-server --tail=10 2>/dev/null | sed 's/password:.*/password: REDACTED/' || true
+            kubectl -n "$ARGO_NS" logs deploy/argocd-repo-server --tail=10 2>/dev/null || true
             sleep 5
           done
           kubectl -n "$ARGO_NS" get applications.argoproj.io || true
           if [ "$ok" -ne 1 ]; then
-            echo "❌ No Applications were generated in ${WAIT_APPS}s."
-            exit 1
+            echo "❌ No Applications were generated in ${WAIT_APPS}s."; exit 1
           fi
 
       - name: (Optional) Show generated Application details
@@ -219,33 +130,3 @@ jobs:
             echo "----- $first -----"
             kubectl -n "$ARGO_NS" get app "$first" -o yaml | sed -e 's/token:.*/token: REDACTED/' || true
           fi
-
-      # ---------- DIAGNOSTICS ON FAILURE ----------
-      - name: Dump diagnostics on failure
-        if: failure()
-        shell: bash
-        run: |
-          echo "::group::Argo CD pods"
-          kubectl -n "$ARGO_NS" get pods -o wide || true
-          echo "::endgroup::"
-
-          echo "::group::ApplicationSet controller logs"
-          kubectl -n "$ARGO_NS" logs deploy/argocd-applicationset-controller --tail=300 || true
-          echo "::endgroup::"
-
-          echo "::group::Application controller logs"
-          kubectl -n "$ARGO_NS" get deploy argocd-application-controller >/dev/null 2>&1 && \
-          kubectl -n "$ARGO_NS" logs deploy/argocd-application-controller --tail=200 || \
-          echo "application-controller not found."
-          echo "::endgroup::"
-
-          echo "::group::Repo server logs"
-          kubectl -n "$ARGO_NS" logs deploy/argocd-repo-server --tail=300 | sed 's/password:.*/password: REDACTED/' || true
-          echo "::endgroup::"
-
-      # ---------- FRIENDLY MESSAGE WHEN SECRETS AREN'T AVAILABLE ----------
-      - name: Note about forked PRs (no secrets)
-        if: ${{ github.event_name == 'pull_request' && env.GH_PAT == '' }}
-        run: |
-          echo "This run is for a PR (likely from a fork). GitHub Actions does not expose secrets to forked PRs."
-          echo "Skipping gh-pat/repo-creds steps; Application generation may fail for private repos."
