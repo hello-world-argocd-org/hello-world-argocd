@@ -7,41 +7,15 @@ spec:
   generators:
     - matrix:
         generators:
-          # 1) SCM providers: list all orgs you want to scan
+          # SCM provider with public GitHub org; no token needed for public repos
           - scmProvider:
               github:
                 organization: hello-world-argocd-org
                 allBranches: false
-                tokenRef:
-                  secretName: gh-pat
-                  key: token
               cloneProtocol: https
               filters:
                 - repositoryMatch: '.*-delivery$'
-#          - scmProvider:
-#              github:
-#                organization: org-two
-#                allBranches: false
-#                tokenRef:
-#                  secretName: gh-pat
-#                  key: token
-#          - scmProvider:
-#              github:
-#                organization: org-three
-#                allBranches: false
-#                tokenRef:
-#                  secretName: gh-pat
-#                  key: token
-          # Optional: GitHub Enterprise
-          # - scmProvider:
-          #     github:
-          #       organization: org-on-ghe
-          #       api: https://ghe.mycorp.com/api/v3
-          #       tokenRef:
-          #         secretName: gh-pat
-          #         key: token
-
-          # 2) For each repo discovered above, scan env folders
+          # For each repo discovered, scan env folders
           - git:
               repoURL: "https://github.com/{{ repository.owner }}/{{ repository.name }}.git"
               revision: HEAD
@@ -56,7 +30,7 @@ spec:
         repo: "{{ repository.name }}"
         env: "{{path.basename}}"
     spec:
-      project: default
+      project: hello-world
       source:
         repoURL: "https://github.com/{{ repository.owner }}/{{ repository.name }}.git"
         targetRevision: HEAD

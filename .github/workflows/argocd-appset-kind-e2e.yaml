@@ -9,22 +9,18 @@ on:
 jobs:
   e2e:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
     env:
       APPSET_DIR: applicationsets
       ARGO_NS: argocd
       ARGO_HELM_CHART_VERSION: "5.51.6"
       WAIT_ROLLOUT: "240s"
       WAIT_APPS: "90"
-      GH_PAT: ${{ secrets.GH_PAT }}   # optional; used only by SCM provider
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Install tools (Helm, yq, jq)
-        shell: bash
         run: |
           curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
           sudo curl -fsSL -o /usr/local/bin/yq https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64
@@ -35,7 +31,6 @@ jobs:
         uses: helm/kind-action@v1.8.0
 
       - name: Install Argo CD (ApplicationSet enabled)
-        shell: bash
         run: |
           set -euo pipefail
           helm repo add argo https://argoproj.github.io/argo-helm
@@ -48,35 +43,7 @@ jobs:
             --wait
           kubectl -n "$ARGO_NS" rollout status deploy/argocd-repo-server --timeout="$WAIT_ROLLOUT" || true
 
-      # DNS: force CoreDNS to forward to public resolvers
-      - name: Force CoreDNS to use public DNS
-        shell: bash
-        run: |
-          set -euo pipefail
-          kubectl -n kube-system get configmap coredns -o yaml > /tmp/coredns.yaml
-          sed -i -E 's#forward[[:space:]]+\.[[:space:]]+/etc/resolv\.conf#forward . 8.8.8.8 8.8.4.4#g' /tmp/coredns.yaml || true
-          kubectl apply -f /tmp/coredns.yaml
-          kubectl -n kube-system rollout restart deploy coredns
-          kubectl -n kube-system rollout status deploy coredns --timeout=90s || true
-
-      # OPTIONAL: SCM provider token for GitHub API listing/rate limits
-      - name: Create gh-pat for SCM provider (optional)
-        if: ${{ github.event_name != 'pull_request' && env.GH_PAT != '' }}
-        shell: bash
-        run: |
-          kubectl -n "$ARGO_NS" create secret generic gh-pat \
-            --from-literal=token="${GH_PAT}" \
-            --dry-run=client -o yaml | kubectl apply -f -
-
-      # Make sure NO repo-creds exist (public repos should be cloned anonymously)
-      - name: Ensure no repo-creds are present
-        shell: bash
-        run: |
-          kubectl -n "$ARGO_NS" get secret -l argocd.argoproj.io/secret-type=repo-creds --no-headers 2>/dev/null | awk '{print $1}' | \
-          xargs -r -I{} kubectl -n "$ARGO_NS" delete secret {}
-
       - name: Show what we are going to apply
-        shell: bash
         run: |
           for f in $APPSET_DIR/*.yaml; do
             echo "---- $f ----"
@@ -84,24 +51,18 @@ jobs:
           done
 
       - name: Apply ApplicationSet manifests
-        shell: bash
         run: |
           kubectl -n "$ARGO_NS" apply -f "$APPSET_DIR/"
 
-      # Sanity: repo-server can resolve GitHub & list refs
-      - name: Sanity — repo-server can reach GitHub (DNS + ls-remote)
-        shell: bash
+      - name: Sanity — repo-server can reach GitHub and list refs
         run: |
           set -euo pipefail
           POD=$(kubectl -n "$ARGO_NS" get pod -l app.kubernetes.io/name=argocd-repo-server -o jsonpath='{.items[0].metadata.name}')
           CONTAINER=$(kubectl -n "$ARGO_NS" get pod "$POD" -o jsonpath='{.spec.containers[0].name}')
-          echo "Using pod=$POD container=$CONTAINER"
           kubectl -n "$ARGO_NS" exec "$POD" -c "$CONTAINER" -- sh -c 'getent hosts github.com || nslookup github.com || true'
-          kubectl -n "$ARGO_NS" exec "$POD" -c "$CONTAINER" -- \
-            git ls-remote https://github.com/hello-world-argocd-org/hello-world-delivery.git | head -n1
+          kubectl -n "$ARGO_NS" exec "$POD" -c "$CONTAINER" -- git ls-remote https://github.com/hello-world-argocd-org/hello-world-delivery.git | head -n1
 
       - name: Wait for Applications to be generated
-        shell: bash
         run: |
           set -euo pipefail
           end=$((SECONDS + WAIT_APPS))
@@ -122,11 +83,9 @@ jobs:
 
       - name: (Optional) Show generated Application details
         if: always()
-        shell: bash
         run: |
           kubectl -n "$ARGO_NS" get applications.argoproj.io -o wide || true
           first=$(kubectl -n "$ARGO_NS" get applications.argoproj.io -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
           if [ -n "$first" ]; then
             echo "----- $first -----"
             kubectl -n "$ARGO_NS" get app "$first" -o yaml | sed -e 's/token:.*/token: REDACTED/' || true
-          fi
