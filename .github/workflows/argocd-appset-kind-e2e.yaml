@@ -1,0 +1,121 @@
+name: Argo CD ApplicationSet E2E (Kind)
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      # Path to your ApplicationSet manifests (explicit orgs)
+      APPSET_PATH: applicationsets/*.yaml
+      ARGO_NS: argocd
+      ARGO_HELM_CHART_VERSION: "5.51.6"   # argo/argo-cd chart version
+      # Increase if your generator has to scan many repos/orgs
+      WAIT_ROLLOUT: "240s"
+      WAIT_APPS: "90"                      # seconds to wait for Applications to appear
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install tools (Helm, yq, jq)
+        shell: bash
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+          sudo curl -fsSL -o /usr/local/bin/yq https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_linux_amd64
+          sudo chmod +x /usr/local/bin/yq
+          sudo apt-get update -y && sudo apt-get install -y jq
+
+      - name: Create Kind cluster
+        uses: helm/kind-action@v1.8.0
+
+      - name: Install Argo CD (ApplicationSet enabled)
+        shell: bash
+        run: |
+          helm repo add argo https://argoproj.github.io/argo-helm
+          helm repo update
+          kubectl create namespace "$ARGO_NS" --dry-run=client -o yaml | kubectl apply -f -
+          helm upgrade --install argocd argo/argo-cd \
+            --namespace "$ARGO_NS" \
+            --version "$ARGO_HELM_CHART_VERSION" \
+            --set applicationSet.enabled=true \
+            --wait
+          kubectl -n "$ARGO_NS" rollout status deploy/argocd-application-controller --timeout="$WAIT_ROLLOUT" || true
+          kubectl -n "$ARGO_NS" rollout status deploy/argocd-repo-server --timeout="$WAIT_ROLLOUT" || true
+          kubectl -n "$ARGO_NS" rollout status deploy/argocd-server --timeout="$WAIT_ROLLOUT" || true
+
+      # If your orgs/repos are private, provide a PAT in secrets.GH_PAT with org read access.
+      - name: (Optional) Configure GitHub PAT for SCM generator
+        if: ${{ secrets.GH_PAT != '' }}
+        shell: bash
+        run: |
+          kubectl -n "$ARGO_NS" create secret generic gh-pat \
+            --from-literal=token="${{ secrets.GH_PAT }}" \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Apply ApplicationSet manifests (explicit orgs)
+        shell: bash
+        run: |
+          # Show what we are going to apply
+          for f in $APPSET_PATH; do
+            echo "---- $f ----"; yq e '.metadata.name' "$f" || true
+          done
+          kubectl -n "$ARGO_NS" apply -f $APPSET_PATH
+
+      - name: Wait for Applications to be generated
+        shell: bash
+        run: |
+          echo "Waiting for Applications to appear from ApplicationSet(s)…"
+          end=$((SECONDS + $WAIT_APPS))
+          ok=0
+          while [ $SECONDS -lt $end ]; do
+            count=$(kubectl -n "$ARGO_NS" get applications.argoproj.io -o json 2>/dev/null | jq '.items | length')
+            if [ "$count" -ge 1 ]; then
+              echo "Found $count Application(s)."
+              ok=1
+              break
+            fi
+            sleep 5
+          done
+          kubectl -n "$ARGO_NS" get applications.argoproj.io || true
+          if [ "$ok" -ne 1 ]; then
+            echo "❌ No Applications were generated in ${WAIT_APPS}s."
+            exit 1
+          fi
+
+      - name: (Optional) Show generated Application details
+        if: always()
+        shell: bash
+        run: |
+          kubectl -n "$ARGO_NS" get applications.argoproj.io -o wide || true
+          # Print first application's spec to help debugging
+          first=$(kubectl -n "$ARGO_NS" get applications.argoproj.io -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+          if [ -n "$first" ]; then
+            echo "----- $first -----"
+            kubectl -n "$ARGO_NS" get app "$first" -o yaml | sed -e 's/token:.*/token: REDACTED/' || true
+          fi
+
+      - name: Dump diagnostics on failure
+        if: failure()
+        shell: bash
+        run: |
+          echo "::group::Argo CD pods"
+          kubectl -n "$ARGO_NS" get pods -o wide || true
+          echo "::endgroup::"
+          echo "::group::ApplicationSet controller logs"
+          kubectl -n "$ARGO_NS" logs deploy/argocd-applicationset-controller --tail=300 || true
+          echo "::endgroup::"
+          echo "::group::Application controller logs"
+          kubectl -n "$ARGO_NS" logs deploy/argocd-application-controller --tail=200 || true
+          echo "::endgroup::"
+          echo "::group::Repo server logs"
+          kubectl -n "$ARGO_NS" logs deploy/argocd-repo-server --tail=200 || true
+          echo "::endgroup::"
