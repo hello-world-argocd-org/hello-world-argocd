@@ -68,7 +68,7 @@ jobs:
           for f in $APPSET_PATH; do
             echo "---- $f ----"; yq e '.metadata.name' "$f" || true
           done
-          kubectl -n "$ARGO_NS" apply -f $APPSET_PATH
+          kubectl -n "$ARGO_NS" apply -f applicationsets/
 
       - name: Wait for Applications to be generated
         shell: bash
