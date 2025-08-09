@@ -65,7 +65,8 @@ jobs:
 
       - name: Configure Argo CD repo-creds for GitHub org
         if: ${{ env.GH_PAT != '' }}
-        env: { GH_PAT: ${ { secrets.GH_PAT } } }
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
         shell: bash
         run: |
           cat <<YAML | kubectl -n "$ARGO_NS" apply -f -
