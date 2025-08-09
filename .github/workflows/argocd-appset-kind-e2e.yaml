@@ -141,6 +141,13 @@ jobs:
             yq e '.kind + " " + .metadata.name' "$f" || true
           done
 
+      - name: Sanity — repo-server can reach GitHub (ls-remote)
+        shell: bash
+        run: |
+          set -euo pipefail
+          kubectl -n "$ARGO_NS" exec deploy/argocd-repo-server -c argocd-repo-server -- \
+            git ls-remote https://github.com/hello-world-argocd-org/hello-world-delivery.git | head -n1
+
       - name: Apply ApplicationSet manifests
         shell: bash
         run: |

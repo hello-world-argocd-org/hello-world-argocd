@@ -43,8 +43,8 @@ spec:
 
           # 2) For each repo discovered above, scan env folders
           - git:
-              repoURL: "{{ repository.cloneURL }}"
-              revision: main
+              repoURL: "https://github.com/{{ repository.owner }}/{{ repository.name }}.git"
+              revision: HEAD
               directories:
                 - path: envs/*
 
@@ -58,8 +58,8 @@ spec:
     spec:
       project: default
       source:
-        repoURL: "{{ repository.cloneURL }}"
-        targetRevision: main
+        repoURL: "https://github.com/{{ repository.owner }}/{{ repository.name }}.git"
+        targetRevision: HEAD
         path: .
         helm:
           releaseName: "{{ repository.name }}-{{path.basename}}"
