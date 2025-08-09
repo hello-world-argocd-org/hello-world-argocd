@@ -151,6 +151,21 @@ jobs:
           kubectl -n "$ARGO_NS" exec "$POD" -c "$CONTAINER" -- \
             git ls-remote https://github.com/hello-world-argocd-org/hello-world-delivery.git | head -n1
 
+      - name: Fix DNS in Kind control-plane & restart CoreDNS
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Get the kind control-plane container name
+          CP=$(docker ps --filter "name=kind-control-plane" --format "{{.Names}}")
+          echo "Kind control-plane container: $CP"
+      
+          # Update /etc/resolv.conf inside control-plane
+          docker exec "$CP" bash -c 'echo -e "nameserver 8.8.8.8\nnameserver 8.8.4.4" > /etc/resolv.conf && cat /etc/resolv.conf'
+      
+          # Restart CoreDNS inside the cluster
+          kubectl -n kube-system rollout restart deploy coredns
+          kubectl -n kube-system rollout status deploy coredns --timeout=60s
+
       - name: Apply ApplicationSet manifests
         shell: bash
         run: |
