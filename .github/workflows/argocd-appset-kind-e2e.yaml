@@ -81,11 +81,39 @@ jobs:
             echo "❌ No Applications were generated in ${WAIT_APPS}s."; exit 1
           fi
 
-      - name: (Optional) Show generated Application details
-        if: always()
+      - name: Verify application endpoints
+        shell: bash
         run: |
-          kubectl -n "$ARGO_NS" get applications.argoproj.io -o wide || true
-          first=$(kubectl -n "$ARGO_NS" get applications.argoproj.io -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
-          if [ -n "$first" ]; then
-            echo "----- $first -----"
-            kubectl -n "$ARGO_NS" get app "$first" -o yaml | sed -e 's/token:.*/token: REDACTED/' || true
+          set -euo pipefail
+          
+          check_env() {
+            local ns="$1"
+            local expected="$2"
+            local svc="springboot-app"
+            local port="8080"
+            echo "Checking $ns (expecting: $expected)"
+          
+            # Port-forward in background
+            kubectl -n "$ns" port-forward "svc/$svc" 18080:$port >/tmp/pf.log 2>&1 &
+            pf_pid=$!
+            # Give port-forward a moment to start
+            sleep 3
+          
+            # Curl and compare
+            actual=$(curl -s http://127.0.0.1:18080/)
+            echo "Got: $actual"
+            if [[ "$actual" != "$expected" ]]; then
+              echo "::error::$ns returned unexpected response"
+              echo "Expected: $expected"
+              echo "Actual:   $actual"
+              kill $pf_pid || true
+              exit 1
+            fi
+          
+            kill $pf_pid || true
+            wait $pf_pid 2>/dev/null || true
+          }
+          
+          check_env dev   "Shared value: [5] env value: [DEV]"
+          check_env stage "Shared value: [5] env value: [STAGE]"
+          check_env prod  "Shared value: [5] env value: [PROD]"
