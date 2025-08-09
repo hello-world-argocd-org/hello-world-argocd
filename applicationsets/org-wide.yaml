@@ -30,7 +30,6 @@ spec:
       project: hello-world
       source:
         repoURL: "https://github.com/{{ repository.owner }}/{{ repository.name }}.git"
-        revision: main
         targetRevision: main
         path: .
         helm:
