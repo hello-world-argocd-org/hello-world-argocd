@@ -53,8 +53,10 @@ jobs:
           kubectl -n "$ARGO_NS" rollout status deploy/argocd-server --timeout="$WAIT_ROLLOUT" || true
 
       # If your orgs/repos are private, provide a PAT in secrets.GH_PAT with org read access.
-      - name: (Optional) Configure GitHub PAT for SCM generator
-        if: env.GH_PAT != ''
+      - name: Configure GitHub PAT for SCM generator
+        if: ${{ env.GH_PAT != '' }}
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
         shell: bash
         run: |
           kubectl -n "$ARGO_NS" create secret generic gh-pat \
