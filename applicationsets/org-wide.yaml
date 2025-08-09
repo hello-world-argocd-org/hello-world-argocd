@@ -16,7 +16,6 @@ spec:
           - git:
               repoURL: "https://github.com/{{ repository.owner }}/{{ repository.name }}.git"
               revision: main
-              targetRevision: main
               directories:
                 - path: envs/*
 
