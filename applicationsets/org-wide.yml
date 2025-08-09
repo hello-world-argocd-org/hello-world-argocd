@@ -1,0 +1,74 @@
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: orgs-delivery-envs
+  namespace: argocd
+spec:
+  generators:
+    - matrix:
+        generators:
+          # 1) SCM providers: list all orgs you want to scan
+          - scmProvider:
+              github:
+                organization: hello-world-argocd-org
+                allBranches: false
+                tokenRef:
+                  secretName: gh-pat
+                  key: token
+#          - scmProvider:
+#              github:
+#                organization: org-two
+#                allBranches: false
+#                tokenRef:
+#                  secretName: gh-pat
+#                  key: token
+#          - scmProvider:
+#              github:
+#                organization: org-three
+#                allBranches: false
+#                tokenRef:
+#                  secretName: gh-pat
+#                  key: token
+          # Optional: GitHub Enterprise
+          # - scmProvider:
+          #     github:
+          #       organization: org-on-ghe
+          #       api: https://ghe.mycorp.com/api/v3
+          #       tokenRef:
+          #         secretName: gh-pat
+          #         key: token
+
+          # 2) For each repo discovered above, scan env folders
+          - git:
+              repoURL: "{{ repository.cloneURL }}"
+              revision: main
+              directories:
+                - path: envs/*
+
+  template:
+    metadata:
+      name: "{{ repository.name }}-{{path.basename}}"
+      labels:
+        org: "{{ repository.owner }}"
+        repo: "{{ repository.name }}"
+        env: "{{path.basename}}"
+    spec:
+      project: default
+      source:
+        repoURL: "{{ repository.cloneURL }}"
+        targetRevision: main
+        path: .
+        helm:
+          releaseName: "{{ repository.name }}-{{path.basename}}"
+          valueFiles:
+            - values.yaml
+            - envs/{{path.basename}}/values.yaml
+      destination:
+        server: https://kubernetes.default.svc
+        namespace: "{{path.basename}}"
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true
+        syncOptions:
+          - CreateNamespace=true
