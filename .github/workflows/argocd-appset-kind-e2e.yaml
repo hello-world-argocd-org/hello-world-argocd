@@ -63,6 +63,27 @@ jobs:
             --from-literal=token="${GH_PAT}" \
             --dry-run=client -o yaml | kubectl apply -f -
 
+      - name: Configure Argo CD repo-creds for GitHub org
+        if: ${{ env.GH_PAT != '' }}
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+        shell: bash
+        run: |
+          cat <<'YAML' | kubectl apply -f -
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: github-org-creds
+            namespace: "$ARGO_NS"
+            labels:
+              argocd.argoproj.io/secret-type: repo-creds
+          stringData:
+            url: https://github.com/hello-world-argocd-org
+            username: git
+            password: ${GH_PAT}
+          type: Opaque
+          YAML
+
       - name: Apply ApplicationSet manifests (explicit orgs)
         shell: bash
         run: |
