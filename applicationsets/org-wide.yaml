@@ -7,18 +7,16 @@ spec:
   generators:
     - matrix:
         generators:
-          # SCM provider with public GitHub org; no token needed for public repos
           - scmProvider:
               github:
                 organization: hello-world-argocd-org
                 allBranches: false
-              cloneProtocol: https
               filters:
                 - repositoryMatch: '.*-delivery$'
-          # For each repo discovered, scan env folders
           - git:
               repoURL: "https://github.com/{{ repository.owner }}/{{ repository.name }}.git"
-              revision: HEAD
+              revision: main
+              targetRevision: main
               directories:
                 - path: envs/*
 
@@ -33,7 +31,8 @@ spec:
       project: hello-world
       source:
         repoURL: "https://github.com/{{ repository.owner }}/{{ repository.name }}.git"
-        targetRevision: HEAD
+        revision: main
+        targetRevision: main
         path: .
         helm:
           releaseName: "{{ repository.name }}-{{path.basename}}"
