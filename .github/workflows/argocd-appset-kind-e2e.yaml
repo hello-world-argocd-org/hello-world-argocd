@@ -81,39 +81,85 @@ jobs:
             echo "❌ No Applications were generated in ${WAIT_APPS}s."; exit 1
           fi
 
-      - name: Verify application endpoints
+      - name: Verify application endpoints (dev/stage/prod)
         shell: bash
         run: |
           set -euo pipefail
+
+            verify_ns () {
+              local ns="$1"
+              local expected="$2"
+  
+              echo "=== Checking namespace: $ns ==="
+  
+              # Find a ClusterIP Service that selects pods (has a selector) and has at least one port
+              read -r SVC PORT <<EOF
+              $(kubectl -n "$ns" get svc -o json | jq -r '
+              .items[]
+              | select(.spec.type=="ClusterIP")
+              | select(.spec.selector!=null and (.spec.selector|length)>0)
+              | select(.spec.ports!=null and (.spec.ports|length)>0)
+              | "\(.metadata.name) \(.spec.ports[0].port)"
+              ' | head -n1)
+              EOF
+        
+                    if [[ -z "${SVC:-}" || -z "${PORT:-}" ]]; then
+                      echo "::error:: No suitable Service found in namespace '$ns'." >&2
+                      kubectl -n "$ns" get svc -o wide || true
+                      exit 1
+                    fi
           
-          check_env() {
-            local ns="$1"
-            local expected="$2"
-            local svc="springboot-app"
-            local port="8080"
-            echo "Checking $ns (expecting: $expected)"
-          
-            # Port-forward in background
-            kubectl -n "$ns" port-forward "svc/$svc" 18080:$port >/tmp/pf.log 2>&1 &
-            pf_pid=$!
-            # Give port-forward a moment to start
-            sleep 3
-          
-            # Curl and compare
-            actual=$(curl -s http://127.0.0.1:18080/)
-            echo "Got: $actual"
-            if [[ "$actual" != "$expected" ]]; then
-              echo "::error::$ns returned unexpected response"
+              echo "Using Service:
+              $SVC port: $PORT"
+              
+              # Wait for endpoints to be ready (up to 90s)
+              end=$((SECONDS + 90))
+              ready=0
+              while [ $SECONDS -lt $end ]; do
+                addrs=$(kubectl -n "$ns" get endpoints "$SVC" -o json 2>/dev/null | jq -r '[.subsets[]?.addresses[]?] | length' || echo 0)
+                if [ "${addrs:-0}" -ge 1 ]; then ready=1; break; fi
+                sleep 3
+              done
+              if [ "$ready" -ne 1 ]; then
+                echo "::error:: Endpoints for $SVC are not ready in $ns."
+                kubectl -n "$ns" get endpoints "$SVC" -o yaml || true
+                exit 1
+              fi
+              
+              # Port-forward and probe with retries
+              kubectl -n "$ns" port-forward "svc/$SVC" 18080:"$PORT" >/tmp/pf-"$ns".log 2>&1 &
+              pf_pid=$!
+              
+              # Give port-forward a moment, then try up to 20 times
+              sleep 2
+              ok=0
+              for i in {1..20}; do
+                if actual=$(curl -fsS http://127.0.0.1:18080/ 2>/dev/null); then
+                  echo "Got: $actual"
+                  if [[ "$actual" == "$expected" ]]; then
+                    ok=1
+                  fi
+                break
+              fi
+              
+              sleep 1
+              done
+              
+              kill "$pf_pid" 2>/dev/null || true
+              wait "$pf_pid" 2>/dev/null || true
+              
+              if [ "$ok" -ne 1 ]; then
+              echo "::error:: Unexpected response in $ns"
               echo "Expected: $expected"
-              echo "Actual:   $actual"
-              kill $pf_pid || true
+              echo "Actual: ${actual:-<no response>}"
+              echo "Port-forward logs:"
+              sed -n '1,120p' "/tmp/pf-$ns.log" || true
               exit 1
-            fi
-          
-            kill $pf_pid || true
-            wait $pf_pid 2>/dev/null || true
+              fi
+              
+              echo "✓ $ns OK"
           }
-          
-          check_env dev   "Shared value: [5] env value: [DEV]"
-          check_env stage "Shared value: [5] env value: [STAGE]"
-          check_env prod  "Shared value: [5] env value: [PROD]"
+
+          verify_ns dev   "Shared value: [5] env value: [DEV]"
+          verify_ns stage "Shared value: [5] env value: [STAGE]"
+          verify_ns prod  "Shared value: [5] env value: [PROD]"
