@@ -1,39 +1,40 @@
 apiVersion: argoproj.io/v1alpha1
 kind: ApplicationSet
 metadata:
-  name: orgs-delivery-envs
+  name: explicit-repos-delivery-envs
   namespace: argocd
 spec:
   generators:
     - matrix:
         generators:
-          - scmProvider:
-              github:
-                organization: hello-world-argocd-org
-                allBranches: false
-              filters:
-                - repositoryMatch: '.*-delivery$'
+          - list:
+              elements:
+                - repoURL: https://github.com/hello-world-argocd-org/hello-world-delivery.git
+                  repoName: hello-world-delivery
+                  org: hello-world-argocd-org
+#                - repoURL: https://github.com/hello-world-argocd-org/another-delivery.git
+#                  repoName: another-delivery
+#                  org: hello-world-argocd-org
           - git:
-              repoURL: "https://github.com/{{ repository.owner }}/{{ repository.name }}.git"
-              revision: main
+              repoURL: "{{ repoURL }}"
+              revision: main            # or HEAD
               directories:
-                - path: envs/*
-
+                - path: envs/*          # must exist in each listed repo
   template:
     metadata:
-      name: "{{ repository.name }}-{{path.basename}}"
+      name: "{{ repoName }}-{{path.basename}}"
       labels:
-        org: "{{ repository.owner }}"
-        repo: "{{ repository.name }}"
-        env: "{{path.basename}}"
+        org: "{{ org }}"
+        repo: "{{ repoName }}"
+        env:  "{{path.basename}}"
     spec:
-      project: hello-world
+      project: default
       source:
-        repoURL: "https://github.com/{{ repository.owner }}/{{ repository.name }}.git"
-        targetRevision: main
+        repoURL: "{{ repoURL }}"
+        targetRevision: main           # or HEAD
         path: .
         helm:
-          releaseName: "{{ repository.name }}-{{path.basename}}"
+          releaseName: "{{ repoName }}-{{path.basename}}"
           valueFiles:
             - values.yaml
             - envs/{{path.basename}}/values.yaml
