@@ -12,13 +12,14 @@ jobs:
     permissions:
       contents: read
     env:
-      # Path to your ApplicationSet manifests (explicit orgs)
-      APPSET_PATH: applicationsets/*.yaml
+      # Paths
+      APPSET_DIR: applicationsets
       ARGO_NS: argocd
-      ARGO_HELM_CHART_VERSION: "5.51.6"   # argo/argo-cd chart version
-      # Increase if your generator has to scan many repos/orgs
+      ARGO_HELM_CHART_VERSION: "8.2.7"
       WAIT_ROLLOUT: "240s"
-      WAIT_APPS: "90"                      # seconds to wait for Applications to appear
+      WAIT_APPS: "90"
+      # Map org/repo PAT once for easy reuse (may be empty on PRs from forks)
+      GH_PAT: ${{ secrets.GH_PAT }}
 
     steps:
       - name: Checkout
@@ -40,6 +41,7 @@ jobs:
       - name: Install Argo CD (ApplicationSet enabled)
         shell: bash
         run: |
+          set -euo pipefail
           helm repo add argo https://argoproj.github.io/argo-helm
           helm repo update
           kubectl create namespace "$ARGO_NS" --dry-run=client -o yaml | kubectl apply -f -
@@ -48,27 +50,56 @@ jobs:
             --version "$ARGO_HELM_CHART_VERSION" \
             --set applicationSet.enabled=true \
             --wait
+          # Rollout checks (non-fatal to keep logs on failures)
           kubectl -n "$ARGO_NS" rollout status deploy/argocd-application-controller --timeout="$WAIT_ROLLOUT" || true
           kubectl -n "$ARGO_NS" rollout status deploy/argocd-repo-server --timeout="$WAIT_ROLLOUT" || true
           kubectl -n "$ARGO_NS" rollout status deploy/argocd-server --timeout="$WAIT_ROLLOUT" || true
 
-      # If your orgs/repos are private, provide a PAT in secrets.GH_PAT with org read access.
-      - name: Configure GitHub PAT for SCM generator
-        if: ${{ env.GH_PAT != '' }}
-        env:
-          GH_PAT: ${{ secrets.GH_PAT }}
+      # ---------- SANITY CHECKS (Argo basics) ----------
+      - name: Sanity — Argo namespace and pods
         shell: bash
         run: |
+          set -euo pipefail
+          kubectl get ns "$ARGO_NS"
+          kubectl -n "$ARGO_NS" get deploy,pods -o wide
+
+      - name: Sanity — Argo core secrets exist (argocd-secret)
+        shell: bash
+        run: |
+          # argocd-secret holds server.secretkey; it can take a few secs to appear.
+          for i in {1..12}; do
+            if kubectl -n "$ARGO_NS" get secret argocd-secret >/dev/null 2>&1; then
+              echo "argocd-secret present."
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "argocd-secret not found after waiting." >&2
+          kubectl -n "$ARGO_NS" get secrets
+          exit 1
+
+      # ---------- CREDENTIALS FOR SCM + GIT CLONE ----------
+      - name: Configure GitHub PAT for SCM generator (gh-pat)
+        if: ${{ github.event_name != 'pull_request' && env.GH_PAT != '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
           kubectl -n "$ARGO_NS" create secret generic gh-pat \
             --from-literal=token="${GH_PAT}" \
             --dry-run=client -o yaml | kubectl apply -f -
 
-      - name: Configure Argo CD repo-creds for GitHub org
-        if: ${{ env.GH_PAT != '' }}
-        env:
-          GH_PAT: ${{ secrets.GH_PAT }}
+      - name: Sanity — gh-pat secret present (SCM token)
+        if: ${{ github.event_name != 'pull_request' && env.GH_PAT != '' }}
         shell: bash
         run: |
+          set -euo pipefail
+          kubectl -n "$ARGO_NS" get secret gh-pat -o jsonpath='{.metadata.name}{"\n"}'
+
+      - name: Configure Argo CD repo-creds for GitHub org (HTTPS + PAT)
+        if: ${{ github.event_name != 'pull_request' && env.GH_PAT != '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
           cat <<YAML | kubectl -n "$ARGO_NS" apply -f -
           apiVersion: v1
           kind: Secret
@@ -78,33 +109,66 @@ jobs:
               argocd.argoproj.io/secret-type: repo-creds
           stringData:
             url: https://github.com/hello-world-argocd-org
-            username: git
+            username: x-access-token
             password: ${GH_PAT}
           type: Opaque
           YAML
 
-      - name: Apply ApplicationSet manifests (explicit orgs)
+      - name: Sanity — repo-creds labeled and shaped
+        if: ${{ github.event_name != 'pull_request' && env.GH_PAT != '' }}
         shell: bash
         run: |
-          # Show what we are going to apply
-          for f in $APPSET_PATH; do
-            echo "---- $f ----"; yq e '.metadata.name' "$f" || true
+          set -euo pipefail
+          kubectl -n "$ARGO_NS" get secret github-org-creds \
+            -o jsonpath='{.metadata.labels.argocd\.argoproj\.io/secret-type}{"\n"}'
+          # Show keys only (no values)
+          kubectl -n "$ARGO_NS" get secret github-org-creds -o json | jq -r '.data | keys[]'
+
+      - name: Nudge repo-server to pick up new creds
+        if: ${{ github.event_name != 'pull_request' && env.GH_PAT != '' }}
+        shell: bash
+        run: |
+          kubectl -n "$ARGO_NS" rollout restart deploy/argocd-repo-server
+          kubectl -n "$ARGO_NS" rollout status deploy/argocd-repo-server --timeout=120s || true
+
+      # ---------- APPLY APPSET ----------
+      - name: Show what we are going to apply
+        shell: bash
+        run: |
+          set -euo pipefail
+          for f in $APPSET_DIR/*.yaml; do
+            echo "---- $f ----"
+            yq e '.kind + " " + .metadata.name' "$f" || true
           done
-          kubectl -n "$ARGO_NS" apply -f applicationsets/
+
+      - name: Apply ApplicationSet manifests
+        shell: bash
+        run: |
+          set -euo pipefail
+          kubectl -n "$ARGO_NS" apply -f "$APPSET_DIR/"
+
+      # ---------- EXTRA VISIBILITY ----------
+      - name: Dump ApplicationSet (rendered spec)
+        shell: bash
+        run: |
+          kubectl -n "$ARGO_NS" get applicationset orgs-delivery-envs -o yaml || true
 
       - name: Wait for Applications to be generated
         shell: bash
         run: |
+          set -euo pipefail
           echo "Waiting for Applications to appear from ApplicationSet(s)…"
           end=$((SECONDS + $WAIT_APPS))
           ok=0
           while [ $SECONDS -lt $end ]; do
             count=$(kubectl -n "$ARGO_NS" get applications.argoproj.io -o json 2>/dev/null | jq '.items | length')
-            if [ "$count" -ge 1 ]; then
+            if [ "${count:-0}" -ge 1 ]; then
               echo "Found $count Application(s)."
               ok=1
               break
             fi
+            # Show repo-server hints while we wait
+            kubectl -n "$ARGO_NS" logs deploy/argocd-repo-server --tail=10 2>/dev/null | sed 's/password:.*/password: REDACTED/' || true
             sleep 5
           done
           kubectl -n "$ARGO_NS" get applications.argoproj.io || true
@@ -118,13 +182,13 @@ jobs:
         shell: bash
         run: |
           kubectl -n "$ARGO_NS" get applications.argoproj.io -o wide || true
-          # Print first application's spec to help debugging
           first=$(kubectl -n "$ARGO_NS" get applications.argoproj.io -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
           if [ -n "$first" ]; then
             echo "----- $first -----"
             kubectl -n "$ARGO_NS" get app "$first" -o yaml | sed -e 's/token:.*/token: REDACTED/' || true
           fi
 
+      # ---------- DIAGNOSTICS ON FAILURE ----------
       - name: Dump diagnostics on failure
         if: failure()
         shell: bash
@@ -132,12 +196,24 @@ jobs:
           echo "::group::Argo CD pods"
           kubectl -n "$ARGO_NS" get pods -o wide || true
           echo "::endgroup::"
+
           echo "::group::ApplicationSet controller logs"
           kubectl -n "$ARGO_NS" logs deploy/argocd-applicationset-controller --tail=300 || true
           echo "::endgroup::"
+
           echo "::group::Application controller logs"
-          kubectl -n "$ARGO_NS" logs deploy/argocd-application-controller --tail=200 || true
+          kubectl -n "$ARGO_NS" get deploy argocd-application-controller >/dev/null 2>&1 && \
+          kubectl -n "$ARGO_NS" logs deploy/argocd-application-controller --tail=200 || \
+          echo "application-controller not found."
           echo "::endgroup::"
+
           echo "::group::Repo server logs"
-          kubectl -n "$ARGO_NS" logs deploy/argocd-repo-server --tail=200 || true
+          kubectl -n "$ARGO_NS" logs deploy/argocd-repo-server --tail=300 | sed 's/password:.*/password: REDACTED/' || true
           echo "::endgroup::"
+
+      # ---------- FRIENDLY MESSAGE WHEN SECRETS AREN'T AVAILABLE ----------
+      - name: Note about forked PRs (no secrets)
+        if: ${{ github.event_name == 'pull_request' && env.GH_PAT == '' }}
+        run: |
+          echo "This run is for a PR (likely from a fork). GitHub Actions does not expose secrets to forked PRs."
+          echo "Skipping gh-pat/repo-creds steps; Application generation may fail for private repos."
