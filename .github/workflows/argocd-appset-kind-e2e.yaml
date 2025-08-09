@@ -54,11 +54,11 @@ jobs:
 
       # If your orgs/repos are private, provide a PAT in secrets.GH_PAT with org read access.
       - name: (Optional) Configure GitHub PAT for SCM generator
-        if: ${{ GH_PAT != '' }}
+        if: env.GH_PAT != ''
         shell: bash
         run: |
           kubectl -n "$ARGO_NS" create secret generic gh-pat \
-            --from-literal=token="${{ GH_PAT }}" \
+            --from-literal=token="${GH_PAT}" \
             --dry-run=client -o yaml | kubectl apply -f -
 
       - name: Apply ApplicationSet manifests (explicit orgs)
