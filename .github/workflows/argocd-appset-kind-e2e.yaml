@@ -82,40 +82,88 @@ jobs:
           fi
           
 
-      # TODO: Fix this
-#      - name: Verify application endpoints
-#        shell: bash
-#        run: |
-#          set -euo pipefail
-#
-#          check_env() {
-#            local ns="$1"
-#            local expected="$2"
-#            local svc="springboot-app"
-#            local port="8080"
-#            echo "Checking $ns (expecting: $expected)"
-#
-#            # Port-forward in background
-#            kubectl -n "$ns" port-forward "svc/$svc" 18080:$port >/tmp/pf.log 2>&1 &
-#            pf_pid=$!
-#            # Give port-forward a moment to start
-#            sleep 3
-#
-#            # Curl and compare
-#            actual=$(curl -s http://127.0.0.1:18080/)
-#            echo "Got: $actual"
-#            if [[ "$actual" != "$expected" ]]; then
-#              echo "::error::$ns returned unexpected response"
-#              echo "Expected: $expected"
-#              echo "Actual:   $actual"
-#              kill $pf_pid || true
-#              exit 1
-#            fi
-#
-#            kill $pf_pid || true
-#            wait $pf_pid 2>/dev/null || true
-#          }
-#
-#          check_env dev   "Shared value: [5] env value: [DEV]"
-#          check_env stage "Shared value: [5] env value: [STAGE]"
-#          check_env prod  "Shared value: [5] env value: [PROD]"
+      - name: Verify application endpoints
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          check_env() {
+            local ns="$1"
+            local expected="$2"
+            local svc="springboot-app"
+            local port="8080"
+            local local_port="18080"
+
+            echo "--> Waiting for deployment in namespace $ns"
+            kubectl -n "$ns" rollout status deploy/$svc --timeout=180s
+
+            echo "--> Port-forwarding service in $ns"
+            kubectl -n "$ns" port-forward "svc/$svc" $local_port:$port >/tmp/pf-$ns.log 2>&1 &
+            pf_pid=$!
+
+            # Give port-forward a moment to start
+            sleep 3
+
+            # Curl and compare
+            actual=$(curl -fsS http://127.0.0.1:$local_port/ || true)
+            echo "Got: $actual"
+            if [[ "$actual" != "$expected" ]]; then
+              echo "::error::$ns returned unexpected response"
+              echo "Expected: $expected"
+              echo "Actual:   $actual"
+              kill $pf_pid || true
+              exit 1
+            fi
+
+            kill $pf_pid || true
+            wait $pf_pid 2>/dev/null || true
+            echo "✅ $ns OK"
+          }
+
+          check_env dev   "Shared value: [5] env value: [DEV]"
+          check_env stage "Shared value: [5] env value: [STAGE]"
+          check_env prod  "Shared value: [5] env value: [PROD]"
+
+      # Always show diagnostics if something fails
+      - name: Dump detailed diagnostics on failure
+        if: failure()
+        run: |
+          set -euo pipefail
+          echo "::group::Cluster info"
+          kubectl cluster-info || true
+          kubectl version || true
+          echo "::endgroup::"
+
+          echo "::group::All resources summary"
+          kubectl get all -A -o wide || true
+          echo "::endgroup::"
+
+          echo "::group::Events (sorted)"
+          kubectl get events -A --sort-by=.lastTimestamp || true
+          echo "::endgroup::"
+
+          echo "::group::Ingresses"
+          kubectl get ingress -A -o yaml || true
+          echo "::endgroup::"
+
+          echo "::group::Endpoints"
+          kubectl get endpoints -A -o yaml || true
+          echo "::endgroup::"
+
+          echo "::group::Namespace-specific deep diagnostics"
+          for ns in dev stage prod; do
+            echo "---- Namespace: $ns ----"
+            kubectl -n "$ns" get all -o wide || true
+            kubectl -n "$ns" get events --sort-by=.lastTimestamp || true
+            pods=$(kubectl -n "$ns" get pods -o name || true)
+            for pod in $pods; do
+              echo "==== Describing $pod ===="
+              kubectl -n "$ns" describe "$pod" || true
+              echo "==== Logs for $pod ===="
+              kubectl -n "$ns" logs "$pod" --all-containers --timestamps || true
+              echo "==== Previous logs for $pod (if restarted) ===="
+              kubectl -n "$ns" logs "$pod" -p --all-containers --timestamps || true
+            done
+          done
+          echo "::endgroup::"
+
