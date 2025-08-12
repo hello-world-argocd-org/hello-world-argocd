@@ -76,25 +76,49 @@ jobs:
           kubectl -n "$ARGO_NS" exec "$POD" -c "$CONTAINER" -- sh -c 'getent hosts github.com || nslookup github.com || true'
           kubectl -n "$ARGO_NS" exec "$POD" -c "$CONTAINER" -- git ls-remote https://github.com/hello-world-argocd-org/hello-world-delivery.git | head -n1
 
-      - name: Wait for Applications to be generated
+      - name: Wait for Applications to be Synced and Healthy
+        shell: bash
         run: |
           set -euo pipefail
-          end=$((SECONDS + WAIT_APPS))
-          ok=0
-          while [ $SECONDS -lt $end ]; do
-            count=$(kubectl -n "$ARGO_NS" get applications.argoproj.io -o json 2>/dev/null | jq '.items | length')
-            if [ "${count:-0}" -ge 1 ]; then
-              echo "Found $count Application(s)."
-              ok=1; break
+          apps=$(kubectl -n "$ARGO_NS" get applications.argoproj.io -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}')
+          echo "Found apps:"
+          echo "$apps"
+          timeout_sec=300
+          for app in $apps; do
+            echo "--> Waiting for $app to be Synced+Healthy (timeout ${timeout_sec}s)"
+            end=$((SECONDS + timeout_sec))
+            ok=0
+            while [ $SECONDS -lt $end ]; do
+              sync=$(kubectl -n "$ARGO_NS" get app "$app" -o jsonpath='{.status.sync.status}' 2>/dev/null || echo "")
+              health=$(kubectl -n "$ARGO_NS" get app "$app" -o jsonpath='{.status.health.status}' 2>/dev/null || echo "")
+              printf "%s: sync=%s health=%s\r" "$app" "$sync" "$health"
+              if [ "$sync" = "Synced" ] && [ "$health" = "Healthy" ]; then
+                ok=1; break
+              fi
+              sleep 3
+            done
+            echo
+            if [ "$ok" -ne 1 ]; then
+              echo "::error::$app did not become Synced+Healthy in ${timeout_sec}s"
+              kubectl -n "$ARGO_NS" get app "$app" -o yaml || true
+              exit 1
             fi
-            kubectl -n "$ARGO_NS" logs deploy/argocd-repo-server --tail=10 2>/dev/null || true
-            sleep 5
           done
-          kubectl -n "$ARGO_NS" get applications.argoproj.io || true
-          if [ "$ok" -ne 1 ]; then
-            echo "❌ No Applications were generated in ${WAIT_APPS}s."; exit 1
-          fi
-          
+          echo "All Applications are Synced and Healthy."
+
+      - name: Wait for namespaces (dev, stage, prod) to exist
+        shell: bash
+        run: |
+          set -euo pipefail
+          for ns in dev stage prod; do
+            echo "--> Waiting for namespace $ns"
+            for i in {1..60}; do
+              kubectl get ns "$ns" >/dev/null 2>&1 && break
+              sleep 2
+            done
+            kubectl get ns "$ns" || { echo "::error::namespace $ns not found"; exit 1; }
+          done
+          echo "Namespaces present."
 
       - name: Verify application endpoints
         shell: bash
