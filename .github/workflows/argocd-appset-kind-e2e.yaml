@@ -94,20 +94,33 @@ jobs:
         run: |
           set -euo pipefail
 
-          check_ready() {
+          wait_for_deploy() {
             local ns="$1"
             local deploy="$2"
-            echo "Waiting for deployment $deploy in namespace $ns..."
+
+            echo "🔍 Waiting for deployment $deploy in namespace $ns to be created..."
+            end=$((SECONDS+300))
+            while [ $SECONDS -lt $end ]; do
+              if kubectl -n "$ns" get deploy "$deploy" >/dev/null 2>&1; then
+                echo "✅ Found $deploy in $ns."
+                break
+              fi
+              sleep 5
+            done
+
+            if ! kubectl -n "$ns" get deploy "$deploy" >/dev/null 2>&1; then
+              echo "❌ Deployment $deploy not found in $ns after waiting."
+              exit 1
+            fi
+
+            echo "⏳ Waiting for $deploy in $ns to finish rolling out..."
             kubectl -n "$ns" rollout status deploy/"$deploy" --timeout=300s
             echo "✅ $deploy in $ns is ready."
           }
 
-          # dev
-          check_ready dev springboot-app
-          # stage
-          check_ready stage springboot-app
-          # prod
-          check_ready prod springboot-app
+          wait_for_deploy dev springboot-app
+          wait_for_deploy stage springboot-app
+          wait_for_deploy prod springboot-app
 
       - name: Verify application endpoints
         shell: bash
